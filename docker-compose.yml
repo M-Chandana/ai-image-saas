@@ -1,0 +1,85 @@
+version: "3.9"
+
+services:
+
+  db:
+    image: postgres:15
+    container_name: ai-db
+    environment:
+      POSTGRES_USER: ${DB_USER}
+      POSTGRES_PASSWORD: ${DB_PASSWORD}
+      POSTGRES_DB: ${DB_NAME}
+    volumes:
+      - db_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis:7
+    container_name: ai-redis
+    ports:
+      - "6379:6379"
+
+  minio:
+    image: minio/minio
+    container_name: ai-minio
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    volumes:
+      - minio_data:/data
+
+  backend:
+    build: ./backend
+    container_name: ai-backend
+    depends_on:
+      - db
+      - redis
+      - minio
+    env_file:
+      - .env
+    environment:
+      DB_HOST: db
+      DB_PORT: 5432
+      DB_USER: ${DB_USER}
+      DB_PASSWORD: ${DB_PASSWORD}
+      DB_NAME: ${DB_NAME}
+    ports:
+      - "8000:8000"
+
+  #worker:
+   # build: ./worker
+    #container_name: ai-worker
+    #depends_on:
+     # - db
+      #- redis
+      #- minio
+    #env_file:
+     # - .env
+    #environment:
+     # DB_HOST: db
+     # DB_PORT: 5432
+     # DB_USER: ${DB_USER}
+     # DB_PASSWORD: ${DB_PASSWORD}
+     # DB_NAME: ${DB_NAME}
+    #dns:
+     # - 8.8.8.8
+      #- 8.8.4.4
+
+  #frontend:
+   # image: node:20
+    #container_name: ai-frontend
+    #working_dir: /app
+    #volumes:
+     # - ./frontend:/app
+    #command: sh -c "npm install && npm run dev"
+   # ports:
+    #  - "3000:3000"
+
+volumes:
+  db_data:
+  minio_data:

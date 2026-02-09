@@ -1,74 +1,66 @@
 import os
-import shutil
+import json
+import uuid
+import redis
+
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, EmailStr
-from .jwt import create_access_token
-from .database import engine, SessionLocal
-from .database import Base
+
+from minio import Minio
+
+from .database import engine, SessionLocal, Base
 from .models import User
 from .jobs import Job
 from .auth import hash_password, verify_password
-from fastapi import FastAPI
-from fastapi.security import HTTPBearer
-from . import models, jobs
-from fastapi.openapi.utils import get_openapi
+from .jwt import create_access_token, decode_access_token
+
+
+# ================= DB =================
 
 Base.metadata.create_all(bind=engine)
 
-UPLOAD_DIR = "uploads"
-os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-security = HTTPBearer()
+# ================= APP =================
 
-app = FastAPI(
-    title="AI Image SaaS",
-    version="0.1.0",
-    openapi_tags=[
-        {"name": "Auth", "description": "Authentication routes"},
-        {"name": "Images", "description": "Image processing routes"},
-    ],
-    swagger_ui_init_oauth={
-        "usePkceWithAuthorizationCodeGrant": True
-    }
+app = FastAPI(title="AI Image SaaS")
+
+
+# ================= CORS =================
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_headers=["*"],
+    allow_methods=["*"],
 )
 
-app.openapi_schema = None
+
+# ================= REDIS =================
+
+r = redis.Redis(host="ai-redis", port=6379, decode_responses=True)
 
 
+# ================= MINIO =================
 
-def custom_openapi():
-    if app.openapi_schema:
-        return app.openapi_schema
+MINIO_BUCKET = "images"
 
-    openapi_schema = get_openapi(
-        title="AI Image SaaS",
-        version="0.1.0",
-        description="AI Image Processing SaaS",
-        routes=app.routes,
-    )
+minio = Minio(
+    "ai-minio:9000",
+    access_key="minioadmin",
+    secret_key="minioadmin",
+    secure=False
+)
 
-    openapi_schema["components"]["securitySchemes"] = {
-        "BearerAuth": {
-            "type": "http",
-            "scheme": "bearer",
-            "bearerFormat": "JWT",
-        }
-    }
-
-    openapi_schema["security"] = [
-        {
-            "BearerAuth": []
-        }
-    ]
-
-    app.openapi_schema = openapi_schema
-    return app.openapi_schema
+if not minio.bucket_exists(MINIO_BUCKET):
+    minio.make_bucket(MINIO_BUCKET)
 
 
-app.openapi = custom_openapi
+# ================= DB DEP =================
 
-# DB Dependency
 def get_db():
     db = SessionLocal()
     try:
@@ -77,119 +69,143 @@ def get_db():
         db.close()
 
 
-# Schemas
-class UserCreate(BaseModel):
+# ================= AUTH =================
+
+security = HTTPBearer()
+
+
+def get_current_user(
+    cred: HTTPAuthorizationCredentials = Depends(security),
+    db: Session = Depends(get_db)
+):
+
+    token = cred.credentials
+
+    data = decode_access_token(token)
+
+    if not data:
+        raise HTTPException(401, "Invalid token")
+
+    user = db.query(User).filter(User.id == data["user_id"]).first()
+
+    if not user:
+        raise HTTPException(401, "User not found")
+
+    return user
+
+
+# ================= SCHEMAS =================
+
+class Auth(BaseModel):
     email: EmailStr
     password: str
 
 
-class UserLogin(BaseModel):
-    email: EmailStr
-    password: str
+# ================= HEALTH =================
 
-
-class JobResponse(BaseModel):
-    id: int
-    status: str
-
-
-# Health
 @app.get("/health")
 def health():
     return {"status": "ok"}
 
 
-@app.get("/ready")
-def ready():
-    return {"status": "ready"}
+# ================= AUTH =================
 
-
-# Signup
 @app.post("/signup")
-def signup(user: UserCreate, db: Session = Depends(get_db)):
+def signup(data: Auth, db: Session = Depends(get_db)):
 
-    exists = db.query(User).filter(User.email == user.email).first()
+    if db.query(User).filter(User.email == data.email).first():
+        raise HTTPException(400, "Email exists")
 
-    if exists:
-        raise HTTPException(status_code=400, detail="Email already registered")
-
-    hashed = hash_password(user.password)
-
-    new_user = User(
-    email=user.email,
-    hashed_password=hashed
-)
-
-    db.add(new_user)
-    db.commit()
-    db.refresh(new_user)
-
-    return {"message": "User created successfully"}
-
-
-# Login
-@app.post("/login")
-def login(user: UserLogin, db: Session = Depends(get_db)):
-
-    db_user = db.query(User).filter(
-        User.email == user.email
-    ).first()
-
-    if not db_user:
-        raise HTTPException(status_code=400, detail="Invalid credentials")
-
-    if not verify_password(user.password, db_user.hashed_password):
-        raise HTTPException(status_code=400, detail="Invalid credentials")
-
-    token = create_access_token(
-        data={"user_id": db_user.id, "email": db_user.email}
+    user = User(
+        email=data.email,
+        hashed_password=hash_password(data.password)
     )
 
-    return {
-        "message": "Login successful",
-        "access_token": token,
-        "token_type": "bearer"
-    }
+    db.add(user)
+    db.commit()
+
+    return {"message": "Created"}
 
 
+@app.post("/login")
+def login(data: Auth, db: Session = Depends(get_db)):
 
-# Upload Image (Create Job)
-@app.post("/upload/{user_id}")
-def upload_image(
-    user_id: int,
+    user = db.query(User).filter(User.email == data.email).first()
+
+    if not user:
+        raise HTTPException(400, "Invalid credentials")
+
+    if not verify_password(data.password, user.hashed_password):
+        raise HTTPException(400, "Invalid credentials")
+
+    token = create_access_token({"user_id": user.id})
+
+    return {"access_token": token}
+
+
+# ================= UPLOAD =================
+
+@app.post("/upload")
+def upload(
     file: UploadFile = File(...),
+    user: User = Depends(get_current_user),
     db: Session = Depends(get_db)
 ):
 
     if file.content_type not in ["image/jpeg", "image/png"]:
-        raise HTTPException(status_code=400, detail="Only JPG and PNG allowed")
+        raise HTTPException(400, "Only JPG/PNG allowed")
 
-    filename = f"{user_id}_{file.filename}"
-    file_path = os.path.join(UPLOAD_DIR, filename)
+    name = f"{user.id}/{uuid.uuid4()}_{file.filename}"
 
-    with open(file_path, "wb") as buffer:
-        shutil.copyfileobj(file.file, buffer)
+    minio.put_object(
+        MINIO_BUCKET,
+        name,
+        file.file,
+        length=-1,
+        part_size=10 * 1024 * 1024,
+        content_type=file.content_type
+    )
 
     job = Job(
-        user_id=user_id,
+        user_id=user.id,
         status="queued",
-        image_path=file_path
+        image_path=name
     )
 
     db.add(job)
     db.commit()
     db.refresh(job)
 
-    return {
+    r.rpush("jobs_queue", json.dumps({
         "job_id": job.id,
-        "status": job.status
-    }
+        "file": name,
+        "user_id": user.id
+    }))
+
+    return {"job_id": job.id}
 
 
-# List Jobs
-@app.get("/jobs/{user_id}")
-def list_jobs(user_id: int, db: Session = Depends(get_db)):
+# ================= JOBS =================
 
-    jobs = db.query(Job).filter(Job.user_id == user_id).all()
+@app.get("/jobs")
+def jobs(
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db)
+):
 
-    return jobs
+    return db.query(Job).filter(
+        Job.user_id == user.id
+    ).all()
+
+
+# ================= FILE SERVE =================
+
+@app.get("/files/{path:path}")
+def get_file(path: str):
+
+    try:
+        data = minio.get_object(MINIO_BUCKET, path)
+        return data.read()
+
+    except:
+        raise HTTPException(404, "Not found")

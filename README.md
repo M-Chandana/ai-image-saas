@@ -35,7 +35,10 @@ Swagger UI was used to test and verify backend APIs. It provides interactive doc
 ### Backend
 ```bash
 uvicorn main:app --reload
-
-##frontend
+```  
+### frontend
+```bash
+cd frontend
 npm install
 npm run dev
+```  

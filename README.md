@@ -34,6 +34,7 @@ Swagger UI was used to test and verify backend APIs. It provides interactive doc
 
 ### Backend
 ```bash
+docker compose up --build
 uvicorn main:app --reload
 ```  
 ### frontend
